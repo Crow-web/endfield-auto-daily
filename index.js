@@ -9,23 +9,23 @@ const creds = process.env.CRED.split('\n').map(s => s.trim()).filter(Boolean)
 const discordWebhook = process.env.DISCORD_WEBHOOK
 const discordUser = process.env.DISCORD_USER
 
+const BINDING_URL = 'https://zonai.skport.com/api/v1/game/player/binding'
 const ATTENDANCE_URL = 'https://zonai.skport.com/web/v1/game/endfield/attendance'
+const ENDFIELD_GAME_ID = '3'
+
 const messages = []
 let hasErrors = false
 
 /**
  * Build headers for SKPort API
  */
-function buildHeaders(cred) {
-  // cred format: "cred|sk_game_role" or just "cred" if role is embedded
-  const [credToken, gameRole] = cred.includes('|') ? cred.split('|') : [cred, null]
-
+function buildHeaders(cred, gameRole = null) {
   const headers = {
     'accept': 'application/json, text/plain, */*',
     'content-type': 'application/json',
     'origin': 'https://game.skport.com',
     'referer': 'https://game.skport.com/',
-    'cred': credToken.trim(),
+    'cred': cred,
     'platform': '3',
     'sk-language': 'en',
     'timestamp': Math.floor(Date.now() / 1000).toString(),
@@ -34,10 +34,55 @@ function buildHeaders(cred) {
   }
 
   if (gameRole) {
-    headers['sk-game-role'] = gameRole.trim()
+    headers['sk-game-role'] = gameRole
   }
 
   return headers
+}
+
+/**
+ * Fetch player binding to get all roles
+ * Returns array of roles with gameRole formatted
+ */
+async function getPlayerRoles(cred) {
+  const headers = buildHeaders(cred)
+  const res = await fetch(BINDING_URL, { method: 'GET', headers })
+  const json = await res.json()
+
+  if (json.code !== 0) {
+    throw new Error(json.message || `Binding API error: ${json.code}`)
+  }
+
+  // Find endfield binding
+  const endfieldApp = json.data?.list?.find(app => app.appCode === 'endfield')
+
+  if (!endfieldApp || !endfieldApp.bindingList?.length) {
+    throw new Error('No Endfield account binding found')
+  }
+
+  // Collect all roles from all bindings
+  const allRoles = []
+
+  for (const binding of endfieldApp.bindingList) {
+    const roles = binding.roles || []
+
+    for (const role of roles) {
+      allRoles.push({
+        gameRole: `${ENDFIELD_GAME_ID}_${role.roleId}_${role.serverId}`,
+        nickname: role.nickname,
+        level: role.level,
+        server: role.serverName,
+        serverId: role.serverId,
+        roleId: role.roleId,
+      })
+    }
+  }
+
+  if (!allRoles.length) {
+    throw new Error('No roles found in binding')
+  }
+
+  return allRoles
 }
 
 /**
@@ -84,29 +129,57 @@ async function claimAttendance(headers) {
 }
 
 /**
- * Run check-in for a single account
+ * Run check-in for a single role
+ */
+async function checkInRole(cred, role) {
+  const headers = buildHeaders(cred, role.gameRole)
+
+  // Check status
+  const status = await checkAttendance(headers)
+
+  if (status.hasToday) {
+    return { success: true, alreadyClaimed: true }
+  }
+
+  // Claim if not signed in
+  const result = await claimAttendance(headers)
+
+  return { success: true, alreadyClaimed: false, rewards: result.rewards }
+}
+
+/**
+ * Run check-in for a single account (all roles)
  */
 async function run(cred, accountIndex) {
   log('debug', `\n----- CHECKING IN FOR ACCOUNT ${accountIndex} -----`)
 
   try {
-    const headers = buildHeaders(cred)
+    // Step 1: Get all player roles
+    log('debug', 'Fetching player binding...')
+    const roles = await getPlayerRoles(cred)
 
-    // Step 1: Check status
-    const status = await checkAttendance(headers)
+    log('info', `Account ${accountIndex}:`, `Found ${roles.length} role(s)`)
 
-    if (status.hasToday) {
-      log('info', `Account ${accountIndex}:`, 'Already checked in today')
-      return
-    }
+    // Step 2: Check in for each role
+    for (const role of roles) {
+      const roleLabel = `${role.nickname} (Lv.${role.level}) [${role.server}]`
 
-    // Step 2: Claim if not signed in
-    const result = await claimAttendance(headers)
+      try {
+        const result = await checkInRole(cred, role)
 
-    if (result.rewards.length > 0) {
-      log('info', `Account ${accountIndex}:`, `Successfully checked in! Rewards: ${result.rewards.join(', ')}`)
-    } else {
-      log('info', `Account ${accountIndex}:`, 'Successfully checked in!')
+        if (result.alreadyClaimed) {
+          log('info', `  → ${roleLabel}:`, 'Already checked in today')
+        } else if (result.rewards?.length > 0) {
+          log('info', `  → ${roleLabel}:`, `Checked in! Rewards: ${result.rewards.join(', ')}`)
+        } else {
+          log('info', `  → ${roleLabel}:`, 'Successfully checked in!')
+        }
+      } catch (error) {
+        log('error', `  → ${roleLabel}:`, error.message)
+      }
+
+      // Small delay between roles to avoid rate limiting
+      await new Promise(resolve => setTimeout(resolve, 500))
     }
 
   } catch (error) {
@@ -171,6 +244,11 @@ if (!creds || !creds.length) {
 
 for (const index in creds) {
   await run(creds[index], Number(index) + 1)
+
+  // Delay between accounts
+  if (index < creds.length - 1) {
+    await new Promise(resolve => setTimeout(resolve, 1000))
+  }
 }
 
 if (discordWebhook && URL.canParse(discordWebhook)) {
